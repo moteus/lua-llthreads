@@ -1,0 +1,32 @@
+PROJECT = 'llthreads'
+
+INSTALL_DIR = INSTALL_DIR or J(ENV.LUA_DIR,'libs',PROJECT)
+
+llthreads = c.shared{PROJECT, 
+  base     = 'src',
+  src      = '*.c',
+  needs    = 'lua',
+  dynamic  = false,
+  strip    = true,
+}
+
+target('build', llthreads)
+
+install = target('install', {
+  file.group{odir=J(INSTALL_DIR, 'share');         src = llthreads };
+  file.group{odir=J(INSTALL_DIR, 'share',PROJECT); src = J('lua', 'llthreads', '*.*')};
+
+  file.group{odir=J(INSTALL_DIR, 'examples');      src = J('examples', '*.*')};
+
+  file.group{odir=J(INSTALL_DIR, 'doc'); src = 'README.md'};
+  -- file.group{odir=J(INSTALL_DIR, 'doc'); src = 'COPYRIGHT'}; -- BUG lake can not proceed file without ext
+})
+
+target('test', install, function()
+  local file = J(INSTALL_DIR,'examples','sub_threads.lua')
+  print("run " .. file)
+  if not TESTING then 
+    os.execute( LUA_EXE .. ' ' .. file )
+  end
+end)
+
