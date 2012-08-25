@@ -1068,7 +1068,7 @@ static void llthread_destroy(Lua_LLThread *this) {
 }
 
 #ifdef __WINDOWS__
-static void run_child_thread(void *arg) {
+static unsigned int __stdcall run_child_thread(void *arg) {
 #else
 static void *run_child_thread(void *arg) {
 #endif
@@ -1099,6 +1099,7 @@ static void *run_child_thread(void *arg) {
 		/* detached thread, close thread handle. */
 		_endthread();
 	}
+	return 0;
 #else
 	return this;
 #endif
@@ -1111,7 +1112,7 @@ static int llthread_start(Lua_LLThread *this, int start_detached) {
 	child = this->child;
 	child->is_detached = start_detached;
 #ifdef __WINDOWS__
-	this->thread = (HANDLE)_beginthread(run_child_thread, 0, child);
+	this->thread = (HANDLE)_beginthreadex(NULL, 0, run_child_thread, child, 0, NULL);
 	if(this->thread != (HANDLE)-1L) {
 		this->state = TSTATE_STARTED;
 		if(start_detached) {
@@ -1131,13 +1132,25 @@ static int llthread_start(Lua_LLThread *this, int start_detached) {
 	return rc;
 }
 
-static int llthread_join(Lua_LLThread *this) {
+static int llthread_join(Lua_LLThread *this
 #ifdef __WINDOWS__
-	WaitForSingleObject( this->thread, INFINITE );
-	/* Destroy the thread object. */
-	CloseHandle( this->thread );
+, DWORD timeout
+#endif
+) {
+#ifdef __WINDOWS__
+	DWORD ret = 0;
+	if(INVALID_HANDLE_VALUE == this->thread) return 0;
+	ret = WaitForSingleObject( this->thread, timeout );
+	if( ret == WAIT_OBJECT_0){ /* Destroy the thread object. */
+		CloseHandle( this->thread );
+		this->thread = INVALID_HANDLE_VALUE;
+		return 0;
+	}
+	else if( ret == WAIT_TIMEOUT ){
+		return 1;
+	}
+	return 2;
 
-	return 0;
 #else
 	Lua_LLThread_child *child;
 	int rc;
@@ -1152,6 +1165,17 @@ static int llthread_join(Lua_LLThread *this) {
 	return rc;
 #endif
 }
+
+#ifdef __WINDOWS__
+static int llthread_kill(Lua_LLThread *this, DWORD exit_code){
+	BOOL ret = TRUE;
+	if(INVALID_HANDLE_VALUE != this->thread){
+		ret = TerminateThread(this->thread, exit_code);
+		this->thread = INVALID_HANDLE_VALUE;
+	}
+	return ret;
+}
+#endif
 
 typedef struct {
 	lua_State *from_L;
@@ -1349,7 +1373,11 @@ static int Lua_LLThread__delete__meth(lua_State *L) {
 	if((this_idx1->state & TSTATE_STARTED) == TSTATE_STARTED &&
 			(this_idx1->state & (TSTATE_DETACHED|TSTATE_JOINED)) == 0) {
 		/* then join the thread. */
-		llthread_join(this_idx1);
+		llthread_join(this_idx1
+#ifdef __WINDOWS__
+      , INFINITE
+#endif
+    );
 		child = this_idx1->child;
 		if(child && child->status != 0) {
 			const char *err_msg = lua_tostring(child->L, -1);
@@ -1396,6 +1424,10 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 	char buf[ERROR_LEN];
 	int top;
 	int rc;
+#ifdef __WINDOWS__
+  DWORD timeout = INFINITE;
+  if(lua_isnumber(L,2))timeout = lua_tointeger(L,2);
+#endif
 
 	if((this_idx1->state & TSTATE_STARTED) == 0) {
 		lua_pushboolean(L, 0); /* false */
@@ -1413,15 +1445,43 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 		return 2;
 	}
 	/* join the thread. */
-	rc = llthread_join(this_idx1);
-	child = this_idx1->child;
+	rc = llthread_join(this_idx1
+#ifdef __WINDOWS__
+    , timeout
+#endif
+  );
+  child = this_idx1->child;
+#ifdef __WINDOWS__
+  if( rc == 0 ){
+		if(child->status != 0) {
+			const char *err_msg = lua_tostring(child->L, -1);
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "Error from child thread: %s", err_msg);
+			return 2;
+		} else {
+			lua_pushboolean(L, 1);
+		}
+		top = lua_gettop(child->L);
+		/* return results to parent thread. */
+		llthread_push_results(L, child, 2, top);
+		return top;
+  }
+  if( rc == 1 ){
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, "timeout");
+    return 2;
+  } 
+  lua_pushboolean(L, 0);
+  lua_pushinteger(L, GetLastError());
+  return 2;
+#else
 
 	/* Push all results after the Lua code. */
 	if(rc == 0 && child) {
 		if(child->status != 0) {
 			const char *err_msg = lua_tostring(child->L, -1);
 			lua_pushboolean(L, 0);
-			lua_pushfstring(L, "Error from child thread: %s", err_msg);
+      lua_pushfstring(L, "Error from child thread: %s", err_msg);
 			return 2;
 		} else {
 			lua_pushboolean(L, 1);
@@ -1439,7 +1499,29 @@ static int Lua_LLThread__join__meth(lua_State *L) {
   lua_pushboolean(L, res_idx1);
   lua_pushstring(L, err_msg_idx2);
   return 2;
+#endif
 }
+
+/* method: kill */
+#ifdef __WINDOWS__
+
+static int Lua_LLThread__kill__meth(lua_State *L) {
+  Lua_LLThread * this_idx1 = obj_type_Lua_LLThread_check(L,1);
+  int rc;
+
+  /* join the thread. */
+  rc = llthread_kill(this_idx1, -1);
+  if( rc == 0 ){
+    lua_pushboolean(L, 0);
+    lua_pushinteger(L, GetLastError());
+    return 2;
+  } 
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+#endif
+
 
 /* method: new */
 static int llthreads__new__func(lua_State *L) {
@@ -1462,6 +1544,9 @@ static const luaL_reg obj_Lua_LLThread_pub_funcs[] = {
 static const luaL_reg obj_Lua_LLThread_methods[] = {
   {"start", Lua_LLThread__start__meth},
   {"join", Lua_LLThread__join__meth},
+#ifdef __WINDOWS__
+  {"kill", Lua_LLThread__kill__meth},
+#endif
   {NULL, NULL}
 };
 
