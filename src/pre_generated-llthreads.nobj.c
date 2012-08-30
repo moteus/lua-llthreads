@@ -1144,6 +1144,7 @@ static int llthread_join(Lua_LLThread *this
 	if( ret == WAIT_OBJECT_0){ /* Destroy the thread object. */
 		CloseHandle( this->thread );
 		this->thread = INVALID_HANDLE_VALUE;
+		this->state |= TSTATE_JOINED;
 		return 0;
 	}
 	else if( ret == WAIT_TIMEOUT ){
