@@ -1425,10 +1425,6 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 	char buf[ERROR_LEN];
 	int top;
 	int rc;
-#ifdef __WINDOWS__
-  DWORD timeout = INFINITE;
-  if(lua_isnumber(L,2))timeout = lua_tointeger(L,2);
-#endif
 
 	if((this_idx1->state & TSTATE_STARTED) == 0) {
 		lua_pushboolean(L, 0); /* false */
@@ -1448,7 +1444,7 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 	/* join the thread. */
 	rc = llthread_join(this_idx1
 #ifdef __WINDOWS__
-    , timeout
+    , luaL_optint(L, 2, INFINITE)
 #endif
   );
   child = this_idx1->child;
@@ -1465,6 +1461,8 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 		top = lua_gettop(child->L);
 		/* return results to parent thread. */
 		llthread_push_results(L, child, 2, top);
+		llthread_child_destroy(child);
+		this_idx1->child = NULL;
 		return top;
   }
   if( rc == 1 ){
@@ -1490,6 +1488,8 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 		top = lua_gettop(child->L);
 		/* return results to parent thread. */
 		llthread_push_results(L, child, 2, top);
+		llthread_child_destroy(child);
+		this_idx1->child = NULL;
 		return top;
 	} else {
 		res_idx1 = false;
