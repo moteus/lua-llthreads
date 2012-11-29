@@ -10,6 +10,54 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
+/* some Lua 5.0 compatibility support. */
+#if !defined(lua_pushliteral)
+#define lua_pushliteral(L, s) lua_pushstring(L, "" s, (sizeof(s)/sizeof(char))-1)
+#endif
+
+#if !defined(LUA_VERSION_NUM)
+#define lua_pushinteger(L, n) lua_pushnumber(L, (lua_Number)n)
+#define luaL_Reg luaL_reg
+#endif
+
+/* some Lua 5.1 compatibility support. */
+#if !defined(LUA_VERSION_NUM) || (LUA_VERSION_NUM == 501)
+/*
+** Adapted from Lua 5.2.0
+*/
+static void luaL_setfuncs (lua_State *L, const luaL_Reg *l, int nup) {
+  luaL_checkstack(L, nup, "too many upvalues");
+  for (; l->name != NULL; l++) {  /* fill the table with given functions */
+    int i;
+    for (i = 0; i < nup; i++)  /* copy upvalues to the top */
+      lua_pushvalue(L, -nup);
+    lua_pushstring(L, l->name);
+    lua_pushcclosure(L, l->func, nup);  /* closure with those upvalues */
+    lua_settable(L, -(nup + 3));
+  }
+  lua_pop(L, nup);  /* remove upvalues */
+}
+
+#define lua_load_no_mode(L, reader, data, source) \
+	lua_load(L, reader, data, source)
+
+#define lua_rawlen(L, idx) lua_objlen(L, idx)
+
+#endif
+
+#if LUA_VERSION_NUM == 502
+
+#define lua_load_no_mode(L, reader, data, source) \
+	lua_load(L, reader, data, source, NULL)
+
+static int luaL_typerror (lua_State *L, int narg, const char *tname) {
+  const char *msg = lua_pushfstring(L, "%s expected, got %s",
+                                    tname, luaL_typename(L, narg));
+  return luaL_argerror(L, narg, msg);
+}
+
+#endif
+
 #define REG_PACKAGE_IS_CONSTRUCTOR 0
 #define REG_MODULES_AS_GLOBALS 0
 #define REG_OBJECTS_AS_GLOBALS 0
@@ -126,6 +174,7 @@ typedef void (*dyn_caster_t)(void **obj, obj_type **type);
 
 #define OBJ_TYPE_FLAG_WEAK_REF (1<<0)
 #define OBJ_TYPE_SIMPLE (1<<1)
+#define OBJ_TYPE_IMPORT (1<<2)
 struct obj_type {
 	dyn_caster_t    dcaster;  /**< caster to support casting to sub-objects. */
 	int32_t         id;       /**< type's id. */
@@ -180,15 +229,21 @@ typedef enum {
 	REG_META,
 } module_reg_type;
 
+typedef struct reg_impl {
+	const char *if_name;
+	const void *impl;
+} reg_impl;
+
 typedef struct reg_sub_module {
 	obj_type        *type;
 	module_reg_type req_type;
-	const luaL_reg  *pub_funcs;
-	const luaL_reg  *methods;
-	const luaL_reg  *metas;
+	const luaL_Reg  *pub_funcs;
+	const luaL_Reg  *methods;
+	const luaL_Reg  *metas;
 	const obj_base  *bases;
 	const obj_field *fields;
 	const obj_const *constants;
+	const reg_impl  *implements;
 	int             bidirectional_consts;
 } reg_sub_module;
 
@@ -295,6 +350,7 @@ static const char *nobj_lua_Reader(lua_State *L, void *data, size_t *size) {
 	nobj_reader_state *state = (nobj_reader_state *)data;
 	const char *ptr;
 
+	(void)L;
 	ptr = state->ffi_init_code[state->offset];
 	if(ptr != NULL) {
 		*size = strlen(ptr);
@@ -318,7 +374,7 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 		lua_settable(L, priv_table);
 		ffi_exports++;
 	}
-	err = lua_load(L, nobj_lua_Reader, &state, ffi_mod_name);
+	err = lua_load_no_mode(L, nobj_lua_Reader, &state, ffi_mod_name);
 	if(0 == err) {
 		lua_pushvalue(L, -2); /* dup C module's table. */
 		lua_pushvalue(L, priv_table); /* move priv_table to top of stack. */
@@ -338,11 +394,194 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 }
 #endif
 
+
+typedef struct {
+	void *impl;
+	void *obj;
+} obj_implement;
+
+static FUNC_UNUSED void *obj_implement_luaoptional(lua_State *L, int _index, void **impl, char *if_name) {
+	void *ud;
+	if(lua_isnoneornil(L, _index)) {
+		return NULL;
+	}
+	/* get the implements table for this interface. */
+	lua_pushlightuserdata(L, if_name);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+
+	/* get pointer to userdata value & check if it is a userdata value. */
+	ud = (obj_implement *)lua_touserdata(L, _index);
+	if(ud != NULL) {
+		/* get the userdata's metatable */
+		if(lua_getmetatable(L, _index)) {
+			/* lookup metatable in interface table for this object's implementation of the interface. */
+			lua_gettable(L, -2);
+		} else {
+			/* no metatable. */
+			goto no_interface;
+		}
+#if LUAJIT_FFI
+	} else if(nobj_ffi_support_enabled_hint) { /* handle cdata. */
+		/* get cdata interface check function from interface table. */
+		lua_getfield(L, -1, "cdata");
+		if(lua_isfunction(L, -1)) {
+			/* pass cdata to function, return value should be an implmentation. */
+			lua_pushvalue(L, _index);
+			lua_call(L, 1, 1);
+			/* get pointer to cdata. */
+			ud = (void *)lua_topointer(L, _index);
+		} else {
+			lua_pop(L, 1); /* pop non-function. */
+			goto no_interface;
+		}
+#endif
+	} else {
+		goto no_interface;
+	}
+
+	if(!lua_isnil(L, -1)) {
+		*impl = lua_touserdata(L, -1);
+		lua_pop(L, 2); /* pop interface table & implementation. */
+		/* object implements interface. */
+		return ud;
+	} else {
+		lua_pop(L, 1); /* pop nil. */
+	}
+no_interface:
+	lua_pop(L, 1); /* pop interface table. */
+	return NULL;
+}
+
+static FUNC_UNUSED void *obj_implement_luacheck(lua_State *L, int _index, void **impl, char *type) {
+	void *ud = obj_implement_luaoptional(L, _index, impl, type);
+	if(ud == NULL) {
+#define ERROR_BUFFER_SIZE 256
+		char buf[ERROR_BUFFER_SIZE];
+		snprintf(buf, ERROR_BUFFER_SIZE-1,"Expected object with %s interface", type);
+		/* value doesn't implement this interface. */
+		luaL_argerror(L, _index, buf);
+	}
+	return ud;
+}
+
+/* use static pointer as key to interfaces table. (version 1.0) */
+static char obj_interfaces_table_key[] = "obj_interfaces<1.0>_table_key";
+
+static void obj_get_global_interfaces_table(lua_State *L) {
+	/* get global interfaces table. */
+	lua_getfield(L, LUA_REGISTRYINDEX, obj_interfaces_table_key);
+	if(lua_isnil(L, -1)) {
+		/* Need to create global interfaces table. */
+		lua_pop(L, 1); /* pop nil */
+		lua_createtable(L, 0, 4); /* 0 size array part, small hash part. */
+		lua_pushvalue(L, -1); /* dup table. */
+		/* store interfaces table in Lua registery. */
+		lua_setfield(L, LUA_REGISTRYINDEX, obj_interfaces_table_key);
+	}
+}
+
+static void obj_get_interface(lua_State *L, const char *name, int global_if_tab) {
+	/* get a interface's implementation table */
+	lua_getfield(L, global_if_tab, name);
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil */
+		/* new interface. (i.e. no object implement it yet.)
+		 *
+		 * create an empty table for this interface that will be used when an
+		 * implementation is registered for this interface.
+		 */
+		lua_createtable(L, 0, 2); /* 0 size array part, small hash part. */
+		lua_pushvalue(L, -1); /* dup table. */
+		lua_setfield(L, global_if_tab, name); /* store interface in global interfaces table. */
+	}
+}
+
+static int obj_get_userdata_interface(lua_State *L) {
+	/* get the userdata's metatable */
+	if(lua_getmetatable(L, 2)) {
+		/* lookup metatable in interface table for the userdata's implementation of the interface. */
+		lua_gettable(L, 1);
+		if(!lua_isnil(L, -1)) {
+			/* return the implementation. */
+			return 1;
+		}
+	}
+	/* no metatable or no implementation. */
+	return 0;
+}
+
+static void obj_interface_register(lua_State *L, char *name, int global_if_tab) {
+	/* get the table of implementations for this interface. */
+	obj_get_interface(L, name, global_if_tab);
+
+	/* check for 'userdata' function. */
+	lua_getfield(L, -1, "userdata");
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil. */
+		/* add C function for getting a userdata's implementation. */
+		lua_pushcfunction(L, obj_get_userdata_interface);
+		lua_setfield(L, -2, "userdata");
+	} else {
+		/* already have function. */
+		lua_pop(L, 1); /* pop C function. */
+	}
+	/* we are going to use a lightuserdata pointer for fast lookup of the interface's impl. table. */
+	lua_pushlightuserdata(L, name);
+	lua_insert(L, -2);
+	lua_settable(L, LUA_REGISTRYINDEX);
+}
+
+static void obj_register_interfaces(lua_State *L, char *interfaces[]) {
+	int i;
+	int if_tab;
+	/* get global interfaces table. */
+	obj_get_global_interfaces_table(L);
+	if_tab = lua_gettop(L);
+
+	for(i = 0; interfaces[i] != NULL ; i++) {
+		obj_interface_register(L, interfaces[i], if_tab);
+	}
+	lua_pop(L, 1); /* pop global interfaces table. */
+}
+
+static void obj_type_register_implement(lua_State *L, const reg_impl *impl, int global_if_tab, int mt_tab) {
+	/* get the table of implementations for this interface. */
+	obj_get_interface(L, impl->if_name, global_if_tab);
+
+	/* register object's implement in the interface table. */
+	lua_pushvalue(L, mt_tab);
+	lua_pushlightuserdata(L, (void *)impl->impl);
+	lua_settable(L, -3);
+
+	lua_pop(L, 1); /* pop inteface table. */
+}
+
+static void obj_type_register_implements(lua_State *L, const reg_impl *impls) {
+	int if_tab;
+	int mt_tab;
+	/* get absolute position of object's metatable. */
+	mt_tab = lua_gettop(L);
+	/* get global interfaces table. */
+	obj_get_global_interfaces_table(L);
+	if_tab = lua_gettop(L);
+
+	for(; impls->if_name != NULL ; impls++) {
+		obj_type_register_implement(L, impls, if_tab, mt_tab);
+	}
+	lua_pop(L, 1); /* pop global interfaces table. */
+}
+
 #ifndef REG_PACKAGE_IS_CONSTRUCTOR
 #define REG_PACKAGE_IS_CONSTRUCTOR 1
 #endif
 
 #ifndef REG_MODULES_AS_GLOBALS
+#define REG_MODULES_AS_GLOBALS 0
+#endif
+
+/* For Lua 5.2 don't register modules as globals. */
+#if LUA_VERSION_NUM == 502
+#undef REG_MODULES_AS_GLOBALS
 #define REG_MODULES_AS_GLOBALS 0
 #endif
 
@@ -354,6 +593,48 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 #define OBJ_DATA_HIDDEN_METATABLE 1
 #endif
 
+static FUNC_UNUSED int obj_import_external_type(lua_State *L, obj_type *type) {
+	/* find the external type's metatable using it's name. */
+	lua_pushstring(L, type->name);
+	lua_rawget(L, LUA_REGISTRYINDEX); /* external type's metatable. */
+	if(!lua_isnil(L, -1)) {
+		/* found it.  Now we will map our 'type' pointer to the metatable. */
+		/* REGISTERY[lightuserdata<type>] = REGISTERY[type->name] */
+		lua_pushlightuserdata(L, type); /* use our 'type' pointer as lookup key. */
+		lua_pushvalue(L, -2); /* dup. type's metatable. */
+		lua_rawset(L, LUA_REGISTRYINDEX); /* save external type's metatable. */
+		/* NOTE: top of Lua stack still has the type's metatable. */
+		return 1;
+	} else {
+		lua_pop(L, 1); /* pop nil. */
+	}
+	return 0;
+}
+
+static FUNC_UNUSED int obj_import_external_ffi_type(lua_State *L, obj_type *type) {
+	/* find the external type's metatable using it's name. */
+	lua_pushstring(L, type->name);
+	lua_rawget(L, LUA_REGISTRYINDEX); /* external type's metatable. */
+	if(!lua_isnil(L, -1)) {
+		/* found it.  Now we will map our 'type' pointer to the C check function. */
+		/* _priv_table[lightuserdata<type>] = REGISTERY[type->name].c_check */
+		lua_getfield(L, -1, "c_check");
+		lua_remove(L, -2); /* remove metatable. */
+		if(lua_isfunction(L, -1)) {
+			lua_pushlightuserdata(L, type); /* use our 'type' pointer as lookup key. */
+			lua_pushvalue(L, -2); /* dup. check function */
+			lua_rawset(L, -4); /* save check function to module's private table. */
+			/* NOTE: top of Lua stack still has the type's C check function. */
+			return 1;
+		} else {
+			lua_pop(L, 1); /* pop non function value. */
+		}
+	} else {
+		lua_pop(L, 1); /* pop nil. */
+	}
+	return 0;
+}
+
 static FUNC_UNUSED obj_udata *obj_udata_toobj(lua_State *L, int _index) {
 	obj_udata *ud;
 	size_t len;
@@ -364,7 +645,7 @@ static FUNC_UNUSED obj_udata *obj_udata_toobj(lua_State *L, int _index) {
 		luaL_typerror(L, _index, "userdata"); /* is not a userdata value. */
 	}
 	/* verify userdata size. */
-	len = lua_objlen(L, _index);
+	len = lua_rawlen(L, _index);
 	if(len != sizeof(obj_udata)) {
 		/* This shouldn't be possible */
 		luaL_error(L, "invalid userdata size: size=%d, expected=%d", len, sizeof(obj_udata));
@@ -377,10 +658,23 @@ static FUNC_UNUSED int obj_udata_is_compatible(lua_State *L, obj_udata *ud, void
 	obj_type *ud_type;
 	lua_pushlightuserdata(L, type);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+recheck_metatable:
 	if(lua_rawequal(L, -1, -2)) {
 		*obj = ud->obj;
 		/* same type no casting needed. */
 		return 1;
+	} else if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil. */
+		if((type->flags & OBJ_TYPE_IMPORT) == 0) {
+			/* can't resolve internal type. */
+			luaL_error(L, "Unknown object type(id=%d, name=%s)", type->id, type->name);
+		}
+		/* try to import external type. */
+		if(obj_import_external_type(L, type)) {
+			/* imported type, re-try metatable check. */
+			goto recheck_metatable;
+		}
+		/* External type not yet available, so the object can't be compatible. */
 	} else {
 		/* Different types see if we can cast to the required type. */
 		lua_rawgeti(L, -2, type->id);
@@ -433,7 +727,7 @@ static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _ind
 				return ud;
 			}
 		}
-	} else {
+	} else if(!lua_isnoneornil(L, _index)) {
 		/* handle cdata. */
 		/* get private table. */
 		lua_pushlightuserdata(L, obj_udata_private_key);
@@ -442,16 +736,30 @@ static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _ind
 		lua_pushlightuserdata(L, type);
 		lua_rawget(L, -2);
 
-		/* pass cdata value to type checking function. */
-		lua_pushvalue(L, _index);
-		lua_call(L, 1, 1);
+		/* check for function. */
 		if(!lua_isnil(L, -1)) {
-			/* valid type get pointer from cdata. */
+got_check_func:
+			/* pass cdata value to type checking function. */
+			lua_pushvalue(L, _index);
+			lua_call(L, 1, 1);
+			if(!lua_isnil(L, -1)) {
+				/* valid type get pointer from cdata. */
+				lua_pop(L, 2);
+				*obj = *(void **)lua_topointer(L, _index);
+				return ud;
+			}
 			lua_pop(L, 2);
-			*obj = *(void **)lua_topointer(L, _index);
-			return ud;
+		} else {
+			lua_pop(L, 1); /* pop nil. */
+			if(type->flags & OBJ_TYPE_IMPORT) {
+				/* try to import external ffi type. */
+				if(obj_import_external_ffi_type(L, type)) {
+					/* imported type. */
+					goto got_check_func;
+				}
+				/* External type not yet available, so the object can't be compatible. */
+			}
 		}
-		lua_pop(L, 2);
 	}
 	if(not_delete) {
 		luaL_typerror(L, _index, type->name); /* is not a userdata value. */
@@ -467,7 +775,7 @@ static FUNC_UNUSED void *obj_udata_luacheck(lua_State *L, int _index, obj_type *
 
 static FUNC_UNUSED void *obj_udata_luaoptional(lua_State *L, int _index, obj_type *type) {
 	void *obj = NULL;
-	if(lua_isnil(L, _index)) {
+	if(lua_isnoneornil(L, _index)) {
 		return obj;
 	}
 	obj_udata_luacheck_internal(L, _index, &(obj), type, 1);
@@ -482,6 +790,9 @@ static FUNC_UNUSED void *obj_udata_luadelete(lua_State *L, int _index, obj_type 
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
+	/* clear the metatable in invalidate userdata. */
+	lua_pushnil(L);
+	lua_setmetatable(L, _index);
 	return obj;
 }
 
@@ -529,6 +840,9 @@ static FUNC_UNUSED void *obj_udata_luadelete_weak(lua_State *L, int _index, obj_
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
+	/* clear the metatable in invalidate userdata. */
+	lua_pushnil(L);
+	lua_setmetatable(L, _index);
 	/* get objects weak table. */
 	lua_pushlightuserdata(L, obj_udata_weak_ref_key);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* weak ref table. */
@@ -646,12 +960,26 @@ static FUNC_UNUSED void * obj_simple_udata_luacheck(lua_State *L, int _index, ob
 		if(lua_getmetatable(L, _index)) {
 			lua_pushlightuserdata(L, type);
 			lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+recheck_metatable:
 			if(lua_rawequal(L, -1, -2)) {
 				lua_pop(L, 2); /* pop both metatables. */
 				return ud;
+			} else if(lua_isnil(L, -1)) {
+				lua_pop(L, 1); /* pop nil. */
+				if((type->flags & OBJ_TYPE_IMPORT) == 0) {
+					/* can't resolve internal type. */
+					luaL_error(L, "Unknown object type(id=%d, name=%s)", type->id, type->name);
+				}
+				/* try to import external type. */
+				if(obj_import_external_type(L, type)) {
+					/* imported type, re-try metatable check. */
+					goto recheck_metatable;
+				}
+				/* External type not yet available, so the object can't be compatible. */
+				return 0;
 			}
 		}
-	} else {
+	} else if(!lua_isnoneornil(L, _index)) {
 		/* handle cdata. */
 		/* get private table. */
 		lua_pushlightuserdata(L, obj_udata_private_key);
@@ -660,22 +988,34 @@ static FUNC_UNUSED void * obj_simple_udata_luacheck(lua_State *L, int _index, ob
 		lua_pushlightuserdata(L, type);
 		lua_rawget(L, -2);
 
-		/* pass cdata value to type checking function. */
-		lua_pushvalue(L, _index);
-		lua_call(L, 1, 1);
+		/* check for function. */
 		if(!lua_isnil(L, -1)) {
-			/* valid type get pointer from cdata. */
-			lua_pop(L, 2);
-			return (void *)lua_topointer(L, _index);
+got_check_func:
+			/* pass cdata value to type checking function. */
+			lua_pushvalue(L, _index);
+			lua_call(L, 1, 1);
+			if(!lua_isnil(L, -1)) {
+				/* valid type get pointer from cdata. */
+				lua_pop(L, 2);
+				return (void *)lua_topointer(L, _index);
+			}
+		} else {
+			if(type->flags & OBJ_TYPE_IMPORT) {
+				/* try to import external ffi type. */
+				if(obj_import_external_ffi_type(L, type)) {
+					/* imported type. */
+					goto got_check_func;
+				}
+				/* External type not yet available, so the object can't be compatible. */
+			}
 		}
-		lua_pop(L, 2);
 	}
 	luaL_typerror(L, _index, type->name); /* is not a userdata value. */
 	return NULL;
 }
 
 static FUNC_UNUSED void * obj_simple_udata_luaoptional(lua_State *L, int _index, obj_type *type) {
-	if(lua_isnil(L, _index)) {
+	if(lua_isnoneornil(L, _index)) {
 		return NULL;
 	}
 	return obj_simple_udata_luacheck(L, _index, type);
@@ -721,9 +1061,9 @@ static FUNC_UNUSED void *obj_simple_udata_luapush(lua_State *L, void *obj, int s
 /* default simple object equal method. */
 static FUNC_UNUSED int obj_simple_udata_default_equal(lua_State *L) {
 	void *ud1 = obj_simple_udata_toobj(L, 1);
-	size_t len1 = lua_objlen(L, 1);
+	size_t len1 = lua_rawlen(L, 1);
 	void *ud2 = obj_simple_udata_toobj(L, 2);
-	size_t len2 = lua_objlen(L, 2);
+	size_t len2 = lua_rawlen(L, 2);
 
 	if(len1 == len2) {
 		lua_pushboolean(L, (memcmp(ud1, ud2, len1) == 0));
@@ -802,12 +1142,12 @@ static void obj_type_register_constants(lua_State *L, const obj_const *constants
 }
 
 static void obj_type_register_package(lua_State *L, const reg_sub_module *type_reg) {
-	const luaL_reg *reg_list = type_reg->pub_funcs;
+	const luaL_Reg *reg_list = type_reg->pub_funcs;
 
 	/* create public functions table. */
 	if(reg_list != NULL && reg_list[0].name != NULL) {
 		/* register functions */
-		luaL_register(L, NULL, reg_list);
+		luaL_setfuncs(L, reg_list, 0);
 	}
 
 	obj_type_register_constants(L, type_reg->constants, -1, type_reg->bidirectional_consts);
@@ -816,23 +1156,23 @@ static void obj_type_register_package(lua_State *L, const reg_sub_module *type_r
 }
 
 static void obj_type_register_meta(lua_State *L, const reg_sub_module *type_reg) {
-	const luaL_reg *reg_list;
+	const luaL_Reg *reg_list;
 
 	/* create public functions table. */
 	reg_list = type_reg->pub_funcs;
 	if(reg_list != NULL && reg_list[0].name != NULL) {
 		/* register functions */
-		luaL_register(L, NULL, reg_list);
+		luaL_setfuncs(L, reg_list, 0);
 	}
 
 	obj_type_register_constants(L, type_reg->constants, -1, type_reg->bidirectional_consts);
 
 	/* register methods. */
-	luaL_register(L, NULL, type_reg->methods);
+	luaL_setfuncs(L, type_reg->methods, 0);
 
 	/* create metatable table. */
 	lua_newtable(L);
-	luaL_register(L, NULL, type_reg->metas); /* fill metatable */
+	luaL_setfuncs(L, type_reg->metas, 0); /* fill metatable */
 	/* setmetatable on meta-object. */
 	lua_setmetatable(L, -2);
 
@@ -840,7 +1180,7 @@ static void obj_type_register_meta(lua_State *L, const reg_sub_module *type_reg)
 }
 
 static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int priv_table) {
-	const luaL_reg *reg_list;
+	const luaL_Reg *reg_list;
 	obj_type *type = type_reg->type;
 	const obj_base *base = type_reg->bases;
 
@@ -857,7 +1197,7 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	reg_list = type_reg->pub_funcs;
 	if(reg_list != NULL && reg_list[0].name != NULL) {
 		/* register "constructors" as to object's public API */
-		luaL_register(L, NULL, reg_list); /* fill public API table. */
+		luaL_setfuncs(L, reg_list, 0); /* fill public API table. */
 
 		/* make public API table callable as the default constructor. */
 		lua_newtable(L); /* create metatable */
@@ -887,7 +1227,7 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 #endif
 	}
 
-	luaL_register(L, NULL, type_reg->methods); /* fill methods table. */
+	luaL_setfuncs(L, type_reg->methods, 0); /* fill methods table. */
 
 	luaL_newmetatable(L, type->name); /* create metatable */
 	lua_pushliteral(L, ".name");
@@ -905,7 +1245,7 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	lua_pushvalue(L, -2); /* dup metatable. */
 	lua_rawset(L, priv_table);    /* priv_table["<object_name>"] = metatable */
 
-	luaL_register(L, NULL, type_reg->metas); /* fill metatable */
+	luaL_setfuncs(L, type_reg->metas, 0); /* fill metatable */
 
 	/* add obj_bases to metatable. */
 	while(base->id >= 0) {
@@ -915,6 +1255,8 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	}
 
 	obj_type_register_constants(L, type_reg->constants, -2, type_reg->bidirectional_consts);
+
+	obj_type_register_implements(L, type_reg->implements);
 
 	lua_pushliteral(L, "__index");
 	lua_pushvalue(L, -3);               /* dup methods table */
@@ -933,6 +1275,80 @@ static FUNC_UNUSED int lua_checktype_ref(lua_State *L, int _index, int _type) {
 	lua_pushvalue(L,_index);
 	return luaL_ref(L, LUA_REGISTRYINDEX);
 }
+
+/* use static pointer as key to weak callback_state table. */
+static char obj_callback_state_weak_ref_key[] = "obj_callback_state_weak_ref_key";
+
+static FUNC_UNUSED void *nobj_get_callback_state(lua_State *L, int owner_idx, int size) {
+	void *cb_state;
+
+	lua_pushlightuserdata(L, obj_callback_state_weak_ref_key); /* key for weak table. */
+	lua_rawget(L, LUA_REGISTRYINDEX);  /* check if weak table exists already. */
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil. */
+		/* create weak table for callback_state */
+		lua_newtable(L);               /* weak table. */
+		lua_newtable(L);               /* metatable for weak table. */
+		lua_pushliteral(L, "__mode");
+		lua_pushliteral(L, "k");
+		lua_rawset(L, -3);             /* metatable.__mode = 'k'  weak keys. */
+		lua_setmetatable(L, -2);       /* add metatable to weak table. */
+		lua_pushlightuserdata(L, obj_callback_state_weak_ref_key); /* key for weak table. */
+		lua_pushvalue(L, -2);          /* dup weak table. */
+		lua_rawset(L, LUA_REGISTRYINDEX);  /* add weak table to registry. */
+	}
+
+	/* check weak table for callback_state. */
+	lua_pushvalue(L, owner_idx); /* dup. owner as lookup key. */
+	lua_rawget(L, -2);
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil. */
+		lua_pushvalue(L, owner_idx); /* dup. owner as lookup key. */
+		/* create new callback state. */
+		cb_state = lua_newuserdata(L, size);
+		lua_rawset(L, -3);
+		lua_pop(L, 1); /* pop <weak table> */
+	} else {
+		/* got existing callback state. */
+		cb_state = lua_touserdata(L, -1);
+		lua_pop(L, 2); /* pop <weak table>, <callback_state> */
+	}
+
+	return cb_state;
+}
+
+static FUNC_UNUSED void *nobj_delete_callback_state(lua_State *L, int owner_idx) {
+	void *cb_state = NULL;
+
+	lua_pushlightuserdata(L, obj_callback_state_weak_ref_key); /* key for weak table. */
+	lua_rawget(L, LUA_REGISTRYINDEX);  /* check if weak table exists already. */
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil.  no weak table, so there is no callback state. */
+		return NULL;
+	}
+	/* get callback state. */
+	lua_pushvalue(L, owner_idx); /* dup. owner */
+	lua_rawget(L, -2);
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 2); /* pop <weak table>, nil.  No callback state for the owner. */
+	} else {
+		cb_state = lua_touserdata(L, -1);
+		lua_pop(L, 1); /* pop <state> */
+		/* remove callback state. */
+		lua_pushvalue(L, owner_idx); /* dup. owner */
+		lua_pushnil(L);
+		lua_rawset(L, -3);
+		lua_pop(L, 1); /* pop <weak table> */
+	}
+
+	return cb_state;
+}
+
+
+
+static char *obj_interfaces[] = {
+  NULL,
+};
 
 
 
@@ -986,7 +1402,7 @@ typedef struct Lua_LLThread {
 #define ERROR_LEN 1024
 
 /******************************************************************************
-* traceback() function from Lua 5.1.x source.
+* traceback() function from Lua 5.1/5.2 source.
 * Copyright (C) 1994-2008 Lua.org, PUC-Rio.  All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining
@@ -1008,10 +1424,12 @@ typedef struct Lua_LLThread {
 * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ******************************************************************************/
+#if !defined(LUA_VERSION_NUM) || (LUA_VERSION_NUM == 501)
+/* from Lua 5.1 */
 static int traceback (lua_State *L) {
   if (!lua_isstring(L, 1))  /* 'message' not a string? */
     return 1;  /* keep it intact */
-  lua_getfield(L, LUA_GLOBALSINDEX, "debug");
+  lua_getglobal(L, "debug");
   if (!lua_istable(L, -1)) {
     lua_pop(L, 1);
     return 1;
@@ -1026,6 +1444,19 @@ static int traceback (lua_State *L) {
   lua_call(L, 2, 1);  /* call debug.traceback */
   return 1;
 }
+#else
+/* from Lua 5.2 */
+static int traceback (lua_State *L) {
+  const char *msg = lua_tostring(L, 1);
+  if (msg)
+    luaL_traceback(L, L, msg, 1);
+  else if (!lua_isnoneornil(L, 1)) {  /* is there an error object? */
+    if (!luaL_callmeta(L, 1, "__tostring"))  /* try its 'tostring' metamethod */
+      lua_pushliteral(L, "(no error message)");
+  }
+  return 1;
+}
+#endif
 
 static Lua_LLThread_child *llthread_child_new() {
 	Lua_LLThread_child *this;
@@ -1056,13 +1487,19 @@ static Lua_LLThread *llthread_new() {
 	return this;
 }
 
+static void llthread_cleanup_child(Lua_LLThread *this) {
+	if(this->child) {
+		llthread_child_destroy(this->child);
+		this->child = NULL;
+	}
+}
+
 static void llthread_destroy(Lua_LLThread *this) {
 	/* We still own the child thread object iff the thread was not started or
 	 * we have joined the thread.
 	 */
 	if((this->state & TSTATE_JOINED) == TSTATE_JOINED || this->state == TSTATE_NONE) {
-		if(this->child) llthread_child_destroy(this->child);
-		this->child = NULL;
+		llthread_cleanup_child(this);
 	}
 	free(this);
 }
@@ -1117,6 +1554,7 @@ static int llthread_start(Lua_LLThread *this, int start_detached) {
 		this->state = TSTATE_STARTED;
 		if(start_detached) {
 			this->state |= TSTATE_DETACHED;
+			this->child = NULL;
 		}
 	}
 #else
@@ -1125,6 +1563,7 @@ static int llthread_start(Lua_LLThread *this, int start_detached) {
 		this->state = TSTATE_STARTED;
 		if(start_detached) {
 			this->state |= TSTATE_DETACHED;
+			this->child = NULL;
 			rc = pthread_detach(this->thread);
 		}
 	}
@@ -1151,17 +1590,13 @@ static int llthread_join(Lua_LLThread *this
 		return 1;
 	}
 	return 2;
-
 #else
-	Lua_LLThread_child *child;
 	int rc;
 
 	/* then join the thread. */
-	rc = pthread_join(this->thread, (void **)&(child));
+	rc = pthread_join(this->thread, NULL);
 	if(rc == 0) {
 		this->state |= TSTATE_JOINED;
-		/* if the child thread returns NULL, then it freed the child object. */
-		this->child = child;
 	}
 	return rc;
 #endif
@@ -1366,9 +1801,10 @@ static Lua_LLThread *llthread_create(lua_State *L, const char *code, size_t code
 /* method: _priv */
 static int Lua_LLThread__delete__meth(lua_State *L) {
   int this_flags_idx1 = 0;
-  Lua_LLThread * this_idx1 = obj_type_Lua_LLThread_delete(L,1,&(this_flags_idx1));
+  Lua_LLThread * this_idx1;
 	Lua_LLThread_child *child;
 
+  this_idx1 = obj_type_Lua_LLThread_delete(L,1,&(this_flags_idx1));
   if(!(this_flags_idx1 & OBJ_UDATA_FLAG_OWN)) { return 0; }
 	/* if the thread has been started and has not been detached/joined. */
 	if((this_idx1->state & TSTATE_STARTED) == TSTATE_STARTED &&
@@ -1376,9 +1812,9 @@ static int Lua_LLThread__delete__meth(lua_State *L) {
 		/* then join the thread. */
 		llthread_join(this_idx1
 #ifdef __WINDOWS__
-      , INFINITE
+			, INFINITE
 #endif
-    );
+		);
 		child = this_idx1->child;
 		if(child && child->status != 0) {
 			const char *err_msg = lua_tostring(child->L, -1);
@@ -1393,12 +1829,14 @@ static int Lua_LLThread__delete__meth(lua_State *L) {
 
 /* method: start */
 static int Lua_LLThread__start__meth(lua_State *L) {
-  Lua_LLThread * this_idx1 = obj_type_Lua_LLThread_check(L,1);
-  bool start_detached_idx2 = lua_toboolean(L,2);
+  Lua_LLThread * this_idx1;
+  bool start_detached_idx2;
   bool res_idx1 = 0;
 	char buf[ERROR_LEN];
 	int rc;
 
+  this_idx1 = obj_type_Lua_LLThread_check(L,1);
+  start_detached_idx2 = lua_toboolean(L,2);
 	if(this_idx1->state != TSTATE_NONE) {
 		lua_pushboolean(L, 0); /* false */
 		lua_pushliteral(L, "Thread already started.");
@@ -1418,14 +1856,19 @@ static int Lua_LLThread__start__meth(lua_State *L) {
 
 /* method: join */
 static int Lua_LLThread__join__meth(lua_State *L) {
-  Lua_LLThread * this_idx1 = obj_type_Lua_LLThread_check(L,1);
+  Lua_LLThread * this_idx1;
   bool res_idx1 = 0;
   const char * err_msg_idx2 = NULL;
 	Lua_LLThread_child *child;
 	char buf[ERROR_LEN];
 	int top;
 	int rc;
+#ifdef __WINDOWS__
+  DWORD timeout = INFINITE;
+  if(lua_isnumber(L,2))timeout = lua_tointeger(L,2);
+#endif
 
+  this_idx1 = obj_type_Lua_LLThread_check(L,1);
 	if((this_idx1->state & TSTATE_STARTED) == 0) {
 		lua_pushboolean(L, 0); /* false */
 		lua_pushliteral(L, "Can't join a thread that hasn't be started.");
@@ -1444,63 +1887,44 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 	/* join the thread. */
 	rc = llthread_join(this_idx1
 #ifdef __WINDOWS__
-    , luaL_optint(L, 2, INFINITE)
+		,luaL_optint(L, 2, INFINITE)
 #endif
-  );
-  child = this_idx1->child;
-#ifdef __WINDOWS__
-  if( rc == 0 ){
-		if(child->status != 0) {
-			const char *err_msg = lua_tostring(child->L, -1);
-			lua_pushboolean(L, 0);
-			lua_pushfstring(L, "Error from child thread: %s", err_msg);
-			return 2;
-		} else {
-			lua_pushboolean(L, 1);
-		}
-		top = lua_gettop(child->L);
-		/* return results to parent thread. */
-		llthread_push_results(L, child, 2, top);
-		llthread_child_destroy(child);
-		this_idx1->child = NULL;
-		return top;
-  }
-  if( rc == 1 ){
-    lua_pushboolean(L, 0);
-    lua_pushstring(L, "timeout");
-    return 2;
-  } 
-  lua_pushboolean(L, 0);
-  lua_pushinteger(L, GetLastError());
-  return 2;
-#else
+	);
+	child = this_idx1->child;
 
 	/* Push all results after the Lua code. */
 	if(rc == 0 && child) {
 		if(child->status != 0) {
 			const char *err_msg = lua_tostring(child->L, -1);
 			lua_pushboolean(L, 0);
-      lua_pushfstring(L, "Error from child thread: %s", err_msg);
-			return 2;
+			lua_pushfstring(L, "Error from child thread: %s", err_msg);
+			top = 2;
 		} else {
 			lua_pushboolean(L, 1);
+			top = lua_gettop(child->L);
+			/* return results to parent thread. */
+			llthread_push_results(L, child, 2, top);
 		}
-		top = lua_gettop(child->L);
-		/* return results to parent thread. */
-		llthread_push_results(L, child, 2, top);
-		llthread_child_destroy(child);
-		this_idx1->child = NULL;
+		llthread_cleanup_child(this_idx1);
 		return top;
-	} else {
+	}
+#ifdef __WINDOWS__
+	else if( rc == 1 ){
+		lua_pushboolean(L, 0);
+		lua_pushstring(L, "timeout");
+		return 2;
+	} 
+#endif
+	else {
 		res_idx1 = false;
 		err_msg_idx2 = buf;
 		strerror_r(errno, buf, ERROR_LEN);
 	}
+	llthread_cleanup_child(this_idx1);
 
   lua_pushboolean(L, res_idx1);
   lua_pushstring(L, err_msg_idx2);
   return 2;
-#endif
 }
 
 /* method: kill */
@@ -1527,9 +1951,10 @@ static int Lua_LLThread__kill__meth(lua_State *L) {
 /* method: new */
 static int llthreads__new__func(lua_State *L) {
   size_t lua_code_len_idx1;
-  const char * lua_code_idx1 = luaL_checklstring(L,1,&(lua_code_len_idx1));
+  const char * lua_code_idx1;
   int this_flags_idx1 = OBJ_UDATA_FLAG_OWN;
   Lua_LLThread * this_idx1;
+  lua_code_idx1 = luaL_checklstring(L,1,&(lua_code_len_idx1));
 	this_idx1 = llthread_create(L, lua_code_idx1, lua_code_len_idx1);
 
   obj_type_Lua_LLThread_push(L, this_idx1, this_flags_idx1);
@@ -1538,11 +1963,11 @@ static int llthreads__new__func(lua_State *L) {
 
 
 
-static const luaL_reg obj_Lua_LLThread_pub_funcs[] = {
+static const luaL_Reg obj_Lua_LLThread_pub_funcs[] = {
   {NULL, NULL}
 };
 
-static const luaL_reg obj_Lua_LLThread_methods[] = {
+static const luaL_Reg obj_Lua_LLThread_methods[] = {
   {"start", Lua_LLThread__start__meth},
   {"join", Lua_LLThread__join__meth},
 #ifdef __WINDOWS__
@@ -1551,7 +1976,7 @@ static const luaL_reg obj_Lua_LLThread_methods[] = {
   {NULL, NULL}
 };
 
-static const luaL_reg obj_Lua_LLThread_metas[] = {
+static const luaL_Reg obj_Lua_LLThread_metas[] = {
   {"__gc", Lua_LLThread__delete__meth},
   {"__tostring", obj_udata_default_tostring},
   {"__eq", obj_udata_default_equal},
@@ -1570,7 +1995,11 @@ static const obj_const obj_Lua_LLThread_constants[] = {
   {NULL, NULL, 0.0 , 0}
 };
 
-static const luaL_reg llthreads_function[] = {
+static const reg_impl obj_Lua_LLThread_implements[] = {
+  {NULL, NULL}
+};
+
+static const luaL_Reg llthreads_function[] = {
   {"new", llthreads__new__func},
   {NULL, NULL}
 };
@@ -1582,8 +2011,8 @@ static const obj_const llthreads_constants[] = {
 
 
 static const reg_sub_module reg_sub_modules[] = {
-  { &(obj_type_Lua_LLThread), REG_OBJECT, obj_Lua_LLThread_pub_funcs, obj_Lua_LLThread_methods, obj_Lua_LLThread_metas, obj_Lua_LLThread_bases, obj_Lua_LLThread_fields, obj_Lua_LLThread_constants, 0},
-  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0}
+  { &(obj_type_Lua_LLThread), REG_OBJECT, obj_Lua_LLThread_pub_funcs, obj_Lua_LLThread_methods, obj_Lua_LLThread_metas, obj_Lua_LLThread_bases, obj_Lua_LLThread_fields, obj_Lua_LLThread_constants, obj_Lua_LLThread_implements, 0},
+  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0}
 };
 
 
@@ -1629,6 +2058,9 @@ LUA_NOBJ_API int luaopen_llthreads(lua_State *L) {
 	const luaL_Reg *submodules = submodule_libs;
 	int priv_table = -1;
 
+	/* register interfaces */
+	obj_register_interfaces(L, obj_interfaces);
+
 	/* private table to hold reference to object metatables. */
 	lua_newtable(L);
 	priv_table = lua_gettop(L);
@@ -1644,7 +2076,7 @@ LUA_NOBJ_API int luaopen_llthreads(lua_State *L) {
 	luaL_register(L, "llthreads", llthreads_function);
 #else
 	lua_newtable(L);
-	luaL_register(L, NULL, llthreads_function);
+	luaL_setfuncs(L, llthreads_function, 0);
 #endif
 
 	/* register module constants. */
@@ -1670,7 +2102,7 @@ LUA_NOBJ_API int luaopen_llthreads(lua_State *L) {
 
 #if LUAJIT_FFI
 	if(nobj_check_ffi_support(L)) {
-		nobj_try_loading_ffi(L, "llthreads", llthreads_ffi_lua_code,
+		nobj_try_loading_ffi(L, "llthreads.nobj.ffi.lua", llthreads_ffi_lua_code,
 			llthreads_ffi_export, priv_table);
 	}
 #endif

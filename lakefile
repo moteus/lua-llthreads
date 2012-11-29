@@ -1,11 +1,21 @@
 PROJECT = 'llthreads'
 
-INSTALL_DIR = INSTALL_DIR or J(ENV.LUA_DIR,'libs',PROJECT)
+if LUA_VER == '5.2' then
+  LUA_NEED = 'lua52'
+  LUA_DIR  = ENV.LUA_DIR_5_2 or ENV.LUA_DIR
+  LUA_RUNNER = 'lua52'
+else
+  LUA_NEED = 'lua'
+  LUA_DIR  = ENV.LUA_DIR
+  LUA_RUNNER = 'lua'
+end
+
+INSTALL_DIR = INSTALL_DIR or J(LUA_DIR,'libs',PROJECT)
 
 llthreads = c.shared{PROJECT, 
   base     = 'src',
   src      = '*.c',
-  needs    = 'lua',
+  needs    = LUA_NEED,
   dynamic  = false,
   strip    = true,
 }
@@ -17,16 +27,28 @@ install = target('install', {
   file.group{odir=J(INSTALL_DIR, 'share',PROJECT); src = J('lua', 'llthreads', '*.*')};
 
   file.group{odir=J(INSTALL_DIR, 'examples');      src = J('examples', '*.*')};
+  file.group{odir=J(INSTALL_DIR, 'test');          src = J('tests', '*.*')};
 
   file.group{odir=J(INSTALL_DIR, 'doc'); src = 'README.md'};
   -- file.group{odir=J(INSTALL_DIR, 'doc'); src = 'COPYRIGHT'}; -- BUG lake can not proceed file without ext
 })
 
-target('test', install, function()
-  local file = J(INSTALL_DIR,'examples','sub_threads.lua')
+local function run(file, cwd)
+  print()
   print("run " .. file)
-  if not TESTING then 
-    os.execute( LUA_EXE .. ' ' .. file )
+  if not TESTING then
+    if cwd then lake.chdir(cwd) end
+    os.execute( LUA_RUNNER .. ' ' .. file )
+    if cwd then lake.chdir("<") end
+    print()
   end
-end)
+end
 
+target('test', install, function()
+  local test_dir = J(INSTALL_DIR,'examples')
+  run(J(test_dir,'sub_threads.lua'), test_dir)
+
+  local test_dir = J(INSTALL_DIR,'test')
+  run(J(test_dir,'test_table_copy.lua'), test_dir)
+  run(J(test_dir,'test_llthreads.lua'), test_dir)
+end)

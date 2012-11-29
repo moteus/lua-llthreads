@@ -72,10 +72,10 @@ local seen = {}
 return dump_recur(seen, obj, 0)
 ]==]
 
-local dump = loadstring(dump_code)
+local dump = (loadstring or load)(dump_code)
 
 local child_code = [==[
-local dump = loadstring[[
+local dump = (loadstring or load)[[
 ]==] .. dump_code .. [==[
 ]]
 local args = ...

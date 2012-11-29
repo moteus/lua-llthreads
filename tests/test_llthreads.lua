@@ -26,7 +26,18 @@ if status then
 	sleep = function(secs)
 		return socket.sleep(secs)
 	end
-else
+end
+
+if not sleep then
+	local status, ztimer = pcall(require, "lzmq.timer")
+	if status then
+		sleep = function(secs)
+			ztimer.sleep(secs * 1000)
+		end
+	end
+end
+
+if not sleep then
 	sleep = function(secs)
 		os.execute("sleep " .. tonumber(secs))
 	end
