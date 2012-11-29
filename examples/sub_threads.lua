@@ -33,7 +33,7 @@ local thread_code = [[
         if lua_init:sub(1,1) == '@' then
             dofile(lua_init:sub(2))
         else
-            assert(loadstring(lua_init))()
+            assert((loadstring or load)(lua_init))()
         end
     end
 

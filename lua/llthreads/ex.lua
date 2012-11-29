@@ -59,6 +59,9 @@ arg = { select(3, ...) }
 ]]
 
 local bootstrap_post = [[
+local loadstring = loadstring or load
+local unpack = table.unpack or unpack
+
 local func
 -- load Lua code.
 if action == 'runfile' then

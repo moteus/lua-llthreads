@@ -1863,10 +1863,6 @@ static int Lua_LLThread__join__meth(lua_State *L) {
 	char buf[ERROR_LEN];
 	int top;
 	int rc;
-#ifdef __WINDOWS__
-  DWORD timeout = INFINITE;
-  if(lua_isnumber(L,2))timeout = lua_tointeger(L,2);
-#endif
 
   this_idx1 = obj_type_Lua_LLThread_check(L,1);
 	if((this_idx1->state & TSTATE_STARTED) == 0) {
